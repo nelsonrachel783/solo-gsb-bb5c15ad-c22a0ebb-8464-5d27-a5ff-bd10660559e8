@@ -391,3 +391,39 @@ class CalibrationTrajectoryResult(BaseModel):
             "仅在本接口即时计算，原始事件、现有状态与分析结果均不被改写"
         ),
     )
+
+
+class TelemetryOutageSegment(BaseModel):
+    start_time: datetime = Field(
+        ..., description="段起点 UTC 时间（含）：同时静默箱数首次达到要求数量的时刻"
+    )
+    end_time: datetime = Field(
+        ..., description="段终点 UTC 时间（不含）：同时静默箱数跌破要求数量的时刻"
+    )
+    duration_seconds: float = Field(..., description="段时长（秒）")
+    peak_simultaneous_boxes: int = Field(
+        ..., description="段内峰值同时静默箱数（不小于 min_simultaneous_boxes）"
+    )
+
+
+class TelemetryOutagesResult(BaseModel):
+    box_codes: list[str] = Field(
+        ..., description="参与查询的箱号（按请求顺序去重后）"
+    )
+    box_count: int = Field(..., description="去重后的箱号数量")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    max_silence_seconds: float = Field(
+        ..., description="最大允许静默秒数：相邻校正时间间隔严格大于它才计为静默"
+    )
+    min_simultaneous_boxes: int = Field(
+        ..., description="最少同时静默箱数：达到该数量的时间段才输出"
+    )
+    outage_count: int = Field(..., description="群体静默时间段数（即 outages 长度）")
+    outages: list[TelemetryOutageSegment] = Field(
+        ...,
+        description=(
+            "至少 min_simultaneous_boxes 箱同时静默的极大时间段（按起点升序，"
+            "半开区间 [start_time, end_time)，端点相接的合格段已合并）"
+        ),
+    )

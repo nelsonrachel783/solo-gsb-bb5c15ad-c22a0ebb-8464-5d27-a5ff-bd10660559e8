@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测静默检测。"""
 import hashlib
 import json
 import math
@@ -1246,4 +1246,129 @@ def calibration_trajectory(
         seq_to=seq_to,
         event_count=len(events),
         points=points,
+    )
+
+
+def telemetry_outages(
+    db: Session,
+    box_codes: list[str],
+    seq_from: int,
+    seq_to: int,
+    max_silence_seconds: float,
+    min_simultaneous_boxes: int,
+) -> schemas.TelemetryOutagesResult:
+    """多箱群体遥测静默检测（只读即时计算，不写库、不改任何原始记录）。
+
+    - box_codes 为已按请求顺序去重的箱号列表（路由层负责去重与空值校验）；
+      任一指定箱号不存在（从未上报过）抛 404，并在 detail 中列出全部缺失箱号
+    - 每箱只取闭区间 [seq_from, seq_to] 内按 seq 升序的实际事件，缺号不补点；
+      事件时间做 clock-audit 同款等权保序回归校正
+    - 相邻校正时间间隔**严格大于** max_silence_seconds 时，以两端校正时间构成
+      该箱的半开静默区间 [起点, 终点)；间隔恰好等于阈值不算静默
+    - 不足两条事件的箱不产生静默区间
+    - 对各箱静默区间做端点扫描（半开区间：同一时刻先处理区间结束、再处理区间开始），
+      输出同时静默箱数 >= min_simultaneous_boxes 的极大时间段及段内峰值同时静默数；
+      端点相接的合格段合并为一段
+    - 阈值比较用精确有理数（秒阈值换算为微秒后与整数微秒间隔比较），
+      避免浮点误差在“恰好等于阈值”的边界上误判
+    """
+    # 1) 指定箱号必须全部存在（至少上报过一条事件），否则 404
+    existing_rows = db.scalars(
+        select(models.BoxEvent.box_code)
+        .where(models.BoxEvent.box_code.in_(box_codes))
+        .distinct()
+    ).all()
+    existing = set(existing_rows)
+    missing = [code for code in box_codes if code not in existing]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "box_not_found",
+                "message": f"以下箱号不存在（从未上报过事件）：{', '.join(missing)}",
+                "missing_box_codes": missing,
+            },
+        )
+
+    # 2) 一次查出所有指定箱在区间内的实际事件，按箱分组（缺号不补点）
+    rows = db.scalars(
+        select(models.BoxEvent)
+        .where(
+            models.BoxEvent.box_code.in_(box_codes),
+            models.BoxEvent.seq >= seq_from,
+            models.BoxEvent.seq <= seq_to,
+        )
+        .order_by(models.BoxEvent.box_code, models.BoxEvent.seq)
+    ).all()
+    events_by_box: dict[str, list[models.BoxEvent]] = {code: [] for code in box_codes}
+    for row in rows:
+        events_by_box[row.box_code].append(row)
+
+    # 3) 逐箱做等权保序校正，间隔严格大于阈值 -> 半开静默区间（整数微秒）
+    threshold_micros = Fraction(max_silence_seconds) * 1_000_000
+    silence_intervals: list[tuple[int, int]] = []  # (起点微秒, 终点微秒)，半开
+    for code in box_codes:
+        events = events_by_box[code]
+        if len(events) < 2:
+            continue  # 不足两条事件的箱不产生区间
+        corrected, _ = _isotonic_suggestions(events)
+        for i in range(len(events) - 1):
+            start_micros, end_micros = corrected[i], corrected[i + 1]
+            if Fraction(end_micros - start_micros) > threshold_micros:
+                silence_intervals.append((start_micros, end_micros))
+
+    # 4) 端点扫描：半开区间在同一时刻先结束(-1)后开始(+1)，
+    #    相邻事件点之间同时静默箱数恒定，构成基本段
+    sweep: dict[int, int] = {}
+    for start_micros, end_micros in silence_intervals:
+        sweep[start_micros] = sweep.get(start_micros, 0) + 1
+        sweep[end_micros] = sweep.get(end_micros, 0) - 1
+    points = sorted(sweep)
+
+    outages: list[schemas.TelemetryOutageSegment] = []
+    active = 0
+    open_start: int | None = None  # 当前未闭合合格段的起点（微秒）
+    open_peak = 0                  # 当前未闭合合格段的峰值同时静默数
+    for idx, t in enumerate(points):
+        active += sweep[t]  # 该时刻之后的基本段 [t, 下一时刻) 的同时静默数
+        if idx + 1 >= len(points):
+            break  # 最后一个事件点右侧不再有区间
+        nxt = points[idx + 1]
+        if active >= min_simultaneous_boxes:
+            if open_start is None:
+                open_start, open_peak = t, active
+            elif active > open_peak:
+                open_peak = active
+        elif open_start is not None:
+            # 跌破要求数量：闭合当前段；端点相接的合格段自然并成一段
+            outages.append(
+                schemas.TelemetryOutageSegment(
+                    start_time=_from_epoch_micros(open_start),
+                    end_time=_from_epoch_micros(t),
+                    duration_seconds=(t - open_start) / 1_000_000,
+                    peak_simultaneous_boxes=open_peak,
+                )
+            )
+            open_start, open_peak = None, 0
+    if open_start is not None:
+        # 扫描结束时仍合格：闭合到最后一个事件点
+        end_micros = points[-1]
+        outages.append(
+            schemas.TelemetryOutageSegment(
+                start_time=_from_epoch_micros(open_start),
+                end_time=_from_epoch_micros(end_micros),
+                duration_seconds=(end_micros - open_start) / 1_000_000,
+                peak_simultaneous_boxes=open_peak,
+            )
+        )
+
+    return schemas.TelemetryOutagesResult(
+        box_codes=box_codes,
+        box_count=len(box_codes),
+        seq_from=seq_from,
+        seq_to=seq_to,
+        max_silence_seconds=max_silence_seconds,
+        min_simultaneous_boxes=min_simultaneous_boxes,
+        outage_count=len(outages),
+        outages=outages,
     )
