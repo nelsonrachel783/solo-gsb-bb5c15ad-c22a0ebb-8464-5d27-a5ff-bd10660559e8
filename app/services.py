@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览、Merkle 包含证明、交接快照、交接箱单对账、温度漂移校准、群体遥测中断扫描。"""
 import hashlib
 import json
 import math
@@ -1246,4 +1246,144 @@ def calibration_trajectory(
         seq_to=seq_to,
         event_count=len(events),
         points=points,
+    )
+
+
+def telemetry_outages(
+    db: Session,
+    box_codes: list[str],
+    seq_from: int,
+    seq_to: int,
+    max_silence_seconds: float,
+    min_simultaneous_boxes: int,
+) -> schemas.TelemetryOutageResult:
+    """查询群体遥测中断（只读即时计算，不写库、不补缺号）。
+
+    box_codes 已由路由层去空白、去重并保持首次出现顺序。
+    - 任一指定箱不存在（从未上报过）：抛 404（box_not_found，附缺失箱号）
+    - 每箱只取闭区间 [seq_from, seq_to] 内的实际事件（按 seq 升序，缺号不补点），
+      事件时间先做 clock-audit 同款等权保序回归校正
+    - 相邻校正时间间隔**严格大于** max_silence_seconds 时，
+      以这两个校正时间为半开静默区间 [t_i, t_{i+1})；不足两条事件的箱不产生区间
+    - 对各箱半开区间做端点扫描，输出至少 min_simultaneous_boxes 箱同时静默的
+      极大时间段，及段内峰值同时静默箱数；端点相接的合格段合并
+      （同一时间点先处理 -1 端点再处理 +1 端点，相接处瞬时下探不拆段）
+    """
+    existing_rows = db.scalars(
+        select(models.BoxEvent.box_code)
+        .distinct()
+        .where(models.BoxEvent.box_code.in_(box_codes))
+    ).all()
+    existing = set(existing_rows)
+    missing = [code for code in box_codes if code not in existing]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "box_not_found",
+                "message": f"以下箱号从未上报过事件：{', '.join(missing)}",
+                "box_codes": missing,
+            },
+        )
+
+    rows = list(
+        db.scalars(
+            select(models.BoxEvent)
+            .where(
+                models.BoxEvent.box_code.in_(box_codes),
+                models.BoxEvent.seq >= seq_from,
+                models.BoxEvent.seq <= seq_to,
+            )
+            .order_by(models.BoxEvent.box_code, models.BoxEvent.seq)
+        ).all()
+    )
+    events_by_box: dict[str, list[models.BoxEvent]] = {code: [] for code in box_codes}
+    for event in rows:
+        events_by_box[event.box_code].append(event)
+
+    # 阈值以整数微秒精确比较：间隔微秒 > max_silence_seconds * 1e6
+    # （max_silence_seconds 已是有限正数，乘 1e6 后四舍五入到微秒）
+    max_gap_micros = int(round(max_silence_seconds * 1_000_000))
+
+    # 端点扫描用的增量表：时间点 -> 该点同时静默箱数的净变化（起点 +1、终点 -1）。
+    # 同一时间点的所有增量先合并成净值再扫描，因此“一箱在 t 结束、另一箱在 t 开始”
+    # 的端点相接不会在 t 处产生正时长空隙，相接的合格段会连成一段。
+    deltas: dict[int, int] = {}
+
+    box_details: list[schemas.TelemetryOutageBoxDetail] = []
+    for code in box_codes:
+        events = events_by_box[code]
+        corrected, _ = _isotonic_suggestions(events)
+        silence_count = 0
+        # 不足两条事件不产生区间
+        for i in range(len(events) - 1):
+            gap_micros = corrected[i + 1] - corrected[i]
+            if gap_micros > max_gap_micros:
+                start_micros = corrected[i]
+                end_micros = corrected[i + 1]
+                deltas[start_micros] = deltas.get(start_micros, 0) + 1
+                deltas[end_micros] = deltas.get(end_micros, 0) - 1
+                silence_count += 1
+        box_details.append(
+            schemas.TelemetryOutageBoxDetail(
+                box_code=code,
+                event_count=len(events),
+                silence_interval_count=silence_count,
+            )
+        )
+
+    # 扫描：在相邻两个不同端点时间之间，同时静默箱数 active 为常数。
+    # 同一时间点 t 的全部 +1/-1 已合并为单个 deltas[t]，故“一箱恰在 t 结束、
+    # 另一箱恰在 t 开始”的端点相接不会产生正时长的不合格空隙——active 只在
+    # 应用 deltas[t] 后的下一个开区间重新判定，相接的合格段自然连成一段；
+    # 只有连续正时长都不合格才会真正收尾拆段。
+    segments: list[schemas.TelemetryOutageSegment] = []
+    cur_start: int | None = None
+    cur_peak = 0
+    active = 0
+    prev_t: int | None = None
+    for t in sorted(deltas):
+        if prev_t is not None and active >= min_simultaneous_boxes:
+            # 开区间 [prev_t, t) 合格：开始或延续当前极大段，刷新峰值
+            if cur_start is None:
+                cur_start = prev_t
+            if active > cur_peak:
+                cur_peak = active
+        elif cur_start is not None:
+            # 开区间 [prev_t, t) 不合格且存在正时长断裂：收尾当前极大段
+            segments.append(
+                schemas.TelemetryOutageSegment(
+                    start_time=_from_epoch_micros(cur_start),
+                    end_time=_from_epoch_micros(prev_t),
+                    duration_seconds=(prev_t - cur_start) / 1_000_000,
+                    peak_simultaneous_boxes=cur_peak,
+                )
+            )
+            cur_start = None
+            cur_peak = 0
+        active += deltas[t]
+        if cur_start is not None and active > cur_peak:
+            cur_peak = active
+        prev_t = t
+
+    if cur_start is not None:
+        segments.append(
+            schemas.TelemetryOutageSegment(
+                start_time=_from_epoch_micros(cur_start),
+                end_time=_from_epoch_micros(prev_t),
+                duration_seconds=(prev_t - cur_start) / 1_000_000,
+                peak_simultaneous_boxes=cur_peak,
+            )
+        )
+
+    return schemas.TelemetryOutageResult(
+        box_codes=box_codes,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        max_silence_seconds=max_silence_seconds,
+        min_simultaneous_boxes=min_simultaneous_boxes,
+        box_count=len(box_codes),
+        outage_segment_count=len(segments),
+        segments=segments,
+        box_details=box_details,
     )

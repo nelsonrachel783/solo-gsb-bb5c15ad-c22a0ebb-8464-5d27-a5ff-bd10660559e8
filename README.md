@@ -22,6 +22,12 @@
 缺报序号不补事件），逐条返回原温度、偏移和校准温度。校准结果**只用于该新接口**，
 不改写原始事件，也不影响现有状态与分析结果。
 
+此外支持**群体遥测中断查询**：`GET /telemetry-outages` 给定**去重后的箱号列表**、
+**共同序号区间**、**最大允许静默秒数**和**最少同时静默箱数**，对每箱区间内实际事件
+按序号做现有等权保序校正，相邻校正时间严格超过阈值的以两端为半开静默区间，
+再对各箱区间做端点扫描，输出至少指定数量箱同时静默的**极大时间段**及段内峰值同时静默数
+（端点相接的合格段合并）。查询只读，缺号不补点、不足两条事件的箱不产生区间。
+
 ## 目录结构
 
 ```
@@ -32,7 +38,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent、交接快照、温度漂移校准模型，(box_code, seq)、handoff_code、(box_code, version) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、时间加权温度中位数、轨迹压缩预览、Merkle 包含证明、交接快照冻结、温度漂移校准、群体遥测中断扫描
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -117,6 +123,7 @@ APP_PORT=9000 docker compose up -d --build
 | POST | `/calibrations`                 | 按箱号 + 版本号保存不可变温度漂移校准锚点列表（至少 2 点、序号严格递增，幂等） |
 | GET  | `/boxes/{box_code}/calibrations/{version}` | 查询某箱某版本的不可变校准锚点列表 |
 | GET  | `/boxes/{box_code}/calibration-trajectory` | 指定版本与序号区间的校准轨迹（锚点间按序号线性插值，不改原始记录） |
+| GET  | `/telemetry-outages`          | 群体遥测中断：多箱共同区间的同时静默极大时间段与峰值（保序校正 + 端点扫描，只读） |
 
 ### 上报事件
 
@@ -1014,6 +1021,151 @@ curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-trajectory?version=99&s
 curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-trajectory?version=1&seq_from=9&seq_to=1'
 ```
 
+## 群体遥测中断（telemetry-outages）
+
+`GET /telemetry-outages`（默认访问端口 **8000**）查询一组箱子在共同序号区间内的
+**群体遥测中断**：至少指定数量的箱子在同一时间段内都没有遥测事件。
+全部结果在查询时即时计算，**只读不写库、不改写原始事件**，乱序补报后重查即重算。
+
+计算规则：
+
+- `box_codes` 可重复传参，服务端**去空白、去重**并按**首次出现顺序**查询。
+- 对每个箱子只取闭区间 `[seq_from, seq_to]` 内的**实际事件**（按 `seq` 升序），
+  **缺号不补点**。
+- 每箱事件时间先做 clock-audit 同款**等权保序回归校正**（整数微秒，PAVA），
+  再比较相邻两条事件的校正时间间隔。
+- 相邻校正时间间隔**严格大于** `max_silence_seconds` 时，
+  以这两个校正时间为一个**半开静默区间** `[t_i, t_{i+1})`
+  （间隔恰等于阈值**不**算静默）。**不足两条事件的箱不产生区间**。
+- 对各箱的半开静默区间做**端点扫描**（sweep line）：
+  - 输出同时静默箱数 **≥ `min_simultaneous_boxes`** 的**极大时间段**；
+  - 每段给出 `peak_simultaneous_boxes`（段内同时静默箱数的峰值）；
+  - **端点相接的合格段合并**：某箱区间结束的同时另一箱区间开始
+    （同一时间点先处理 -1 再处理 +1），相接处仅瞬时（零时长）下探不拆段；
+    存在正时长断裂才分成两段。
+
+查询参数（均通过 query string 传递）：
+
+- `box_codes`：箱号列表，**至少 1 个**，重复传参
+  （`?box_codes=A&box_codes=B`）；自动去空白、去重；空箱号/超过 64 字符返回 `422`。
+- `seq_from` / `seq_to`：共同序号区间，**均为整数且含端点**，必须 `>= 0` 且
+  `seq_from <= seq_to`，否则 `422`。
+- `max_silence_seconds`：最大允许静默秒数，**必须为正的有限数值**
+  （`0`、负数、`NaN`/`Infinity` 均 `422`）。
+- `min_simultaneous_boxes`：判定群体中断所需的最少同时静默箱数，**正整数（≥1）**；
+  大于实际箱数时合法但结果为空（`segments=[]`）。
+
+返回字段：
+
+| 字段                          | 说明                                                          |
+| ----------------------------- | ------------------------------------------------------------- |
+| `box_codes`                   | 去重后实际参与查询的箱号（保持首次出现顺序）                  |
+| `box_count`                   | 去重后的箱数                                                  |
+| `seq_from` / `seq_to`         | 实际使用的共同序号区间                                        |
+| `max_silence_seconds`         | 实际使用的最大允许静默秒数                                    |
+| `min_simultaneous_boxes`      | 实际使用的最少同时静默箱数                                    |
+| `outage_segment_count`        | 合格极大时间段数量（端点相接已合并）                          |
+| `segments[]`                  | 极大群体静默时间段（按起点升序）                              |
+| `box_details[]`               | 逐箱的区间事件数 `event_count` 与静默区间数 `silence_interval_count` |
+
+`segments[]` 中每段包含：`start_time` / `end_time`（**半开** `[start, end)`，
+均为各箱保序校正后的 UTC 时间）、`duration_seconds`（段时长，秒）、
+`peak_simultaneous_boxes`（段内峰值同时静默箱数）。
+
+错误情况：任一指定箱不存在（从未上报过）返回 `404`（响应中附缺失箱号列表）；
+缺少参数、参数非整数/非数值、`seq_from > seq_to`、空箱号、`max_silence_seconds <= 0`、
+`min_simultaneous_boxes < 1`、`NaN`/`Infinity` 等返回 `422`。
+
+```bash
+# 三箱都上报 5 条事件（UTC），每分钟一条但中间有 90 秒空档（seq 可跳号，缺号不补）
+for b in BOX-O1 BOX-O2 BOX-O3; do
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"$b\",\"seq\":0,\"temperature\":-5.0,
+         \"event_time\":\"2026-09-25T02:00:00+00:00\"}"
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"$b\",\"seq\":1,\"temperature\":-5.0,
+         \"event_time\":\"2026-09-25T02:01:00+00:00\"}"
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"$b\",\"seq\":2,\"temperature\":-5.0,
+         \"event_time\":\"2026-09-25T02:02:30+00:00\"}"
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"$b\",\"seq\":3,\"temperature\":-5.0,
+         \"event_time\":\"2026-09-25T02:03:30+00:00\"}"
+  curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+    -d "{\"box_code\":\"$b\",\"seq\":4,\"temperature\":-5.0,
+         \"event_time\":\"2026-09-25T02:05:00+00:00\"}"
+done
+
+# 查询共同区间 [0,9]：阈值 60 秒、至少 3 箱同时静默
+curl -G http://localhost:8000/telemetry-outages \
+  --data-urlencode 'box_codes=BOX-O1' \
+  --data-urlencode 'box_codes=BOX-O2' \
+  --data-urlencode 'box_codes=BOX-O3' \
+  --data-urlencode 'seq_from=0' --data-urlencode 'seq_to=9' \
+  --data-urlencode 'max_silence_seconds=60' \
+  --data-urlencode 'min_simultaneous_boxes=3'
+```
+
+响应（两处 90 秒空档 [02:01:00,02:02:30)、[02:03:30,02:05:00) 中三箱同时静默，
+形成两个极大段，段内峰值均为 3；60 秒的正常间隔因“严格大于”不计入）：
+
+```json
+{
+  "box_codes": ["BOX-O1", "BOX-O2", "BOX-O3"],
+  "seq_from": 0,
+  "seq_to": 9,
+  "max_silence_seconds": 60.0,
+  "min_simultaneous_boxes": 3,
+  "box_count": 3,
+  "outage_segment_count": 2,
+  "segments": [
+    {
+      "start_time": "2026-09-25T02:01:00",
+      "end_time": "2026-09-25T02:02:30",
+      "duration_seconds": 90.0,
+      "peak_simultaneous_boxes": 3
+    },
+    {
+      "start_time": "2026-09-25T02:03:30",
+      "end_time": "2026-09-25T02:05:00",
+      "duration_seconds": 90.0,
+      "peak_simultaneous_boxes": 3
+    }
+  ],
+  "box_details": [
+    {"box_code": "BOX-O1", "event_count": 5, "silence_interval_count": 2},
+    {"box_code": "BOX-O2", "event_count": 5, "silence_interval_count": 2},
+    {"box_code": "BOX-O3", "event_count": 5, "silence_interval_count": 2}
+  ]
+}
+```
+
+```bash
+# box_codes 重复 -> 自动去重；某箱不存在 -> 404（附缺失箱号）
+curl -i -G http://localhost:8000/telemetry-outages \
+  --data-urlencode 'box_codes=BOX-O1' --data-urlencode 'box_codes=BOX-O1' \
+  --data-urlencode 'box_codes=NO-SUCH-BOX' \
+  --data-urlencode 'seq_from=0' --data-urlencode 'seq_to=9' \
+  --data-urlencode 'max_silence_seconds=60' \
+  --data-urlencode 'min_simultaneous_boxes=2'
+
+# 箱存在但区间内无事件 / 不足两条事件 -> 200，silence_interval_count=0、segments=[]
+# min_simultaneous_boxes 大于箱数 -> 200，segments=[]
+curl -G http://localhost:8000/telemetry-outages \
+  --data-urlencode 'box_codes=BOX-O1' \
+  --data-urlencode 'seq_from=100' --data-urlencode 'seq_to=200' \
+  --data-urlencode 'max_silence_seconds=60' \
+  --data-urlencode 'min_simultaneous_boxes=1'
+
+# 参数非法：seq_from>seq_to、max_silence_seconds<=0、min_simultaneous_boxes<1、
+# 缺少 box_codes、空箱号、NaN/Infinity -> 422
+curl -i -G http://localhost:8000/telemetry-outages \
+  --data-urlencode 'box_codes=BOX-O1' \
+  --data-urlencode 'seq_from=5' --data-urlencode 'seq_to=2' \
+  --data-urlencode 'max_silence_seconds=60' \
+  --data-urlencode 'min_simultaneous_boxes=1'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -1073,6 +1225,16 @@ curl -i 'http://localhost:8000/boxes/BOX-CAL/calibration-trajectory?version=1&se
   区间两端沿用最近锚点偏移而不外推，缺报序号不补事件。校准结果仅在
   `/boxes/{box_code}/calibration-trajectory` 返回，**不写库、不改写原始事件，
   也不影响最新状态、交接快照与既有分析接口**；补报事件后重查即基于最新数据重算。
+- **群体遥测中断只读**：`GET /telemetry-outages` 先用一次 `DISTINCT` 查询判定全部
+  指定箱号是否存在（任一不存在即 404，缺失箱号在详情中列出），再一次性取出各箱
+  共同闭区间内的实际事件（按箱号、序号排序，缺号不补点）。每箱时间复用 clock-audit
+  的等权保序回归校正（整数微秒，PAVA），相邻校正间隔以微秒整数与
+  `max_silence_seconds * 1e6` 比较，**严格大于**才算静默，半开区间 `[t_i, t_{i+1})`
+  天然避免端点重复计数；不足两条事件的箱不产生区间。随后对各箱区间做**端点扫描**：
+  同一时间点的 +1/-1 增量合并处理（排序上 -1 先于 +1），相邻不同时间点之间的
+  同时静默数为常数，据此取 ≥ `min_simultaneous_boxes` 的极大段并记录段内峰值；
+  端点相接（一箱结束、另一箱同刻开始）时相接处仅零时长瞬时下探，合格段自动合并。
+  整个过程不写库、不改写原始事件，补报后重查即基于最新数据重算。
 - **校验错误兜底**：请求体携带 `NaN`/`Infinity` 时，校验错误的详情里会带上这些
   非有限浮点，而 Starlette 的 JSON 响应不允许序列化它们；`main.py` 自定义了
   `RequestValidationError` 处理器，先把错误详情中的 NaN/Inf 替换为字符串再返回 422，

@@ -36,9 +36,12 @@ app = FastAPI(
         "- 温度漂移校准：POST /calibrations 按箱号 + 版本号保存不可变锚点列表（至少 2 个、"
         "序号严格递增、偏移有限），同箱同版本原样重交幂等、异内容 409；"
         "GET /boxes/{box_code}/calibration-trajectory 按锚点线性插值给出校准温度，"
-        "缺报序号不补事件，且不改写原始事件或现有状态与分析结果"
+        "缺报序号不补事件，且不改写原始事件或现有状态与分析结果\n"
+        "- 群体遥测中断：GET /telemetry-outages 按去重箱号列表、共同序号区间、"
+        "最大允许静默秒数与最少同时静默箱数，对各箱保序校正时间的半开静默区间做端点扫描，"
+        "输出至少指定箱数同时静默的极大时间段与段内峰值（只读不写回）"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -394,6 +397,85 @@ def get_box_trajectory_compression(
     if result is None:
         raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
     return result
+
+
+@app.get(
+    "/telemetry-outages",
+    tags=["telemetry"],
+    response_model=schemas.TelemetryOutageResult,
+    summary="查询群体遥测中断（保序校正时间 + 端点扫描，只读不写回）",
+)
+def get_telemetry_outages(
+    db: DbSession,
+    box_codes: Annotated[
+        list[str],
+        Query(
+            min_length=1,
+            description=(
+                "箱号列表，可重复传参（?box_codes=A&box_codes=B）；"
+                "服务端去空白、去重后按首次出现顺序查询"
+            ),
+        ),
+    ],
+    seq_from: Annotated[int, Query(ge=0, description="共同序号区间起点（含）")],
+    seq_to: Annotated[int, Query(ge=0, description="共同序号区间终点（含）")],
+    max_silence_seconds: Annotated[
+        float,
+        Query(
+            gt=0,
+            allow_inf_nan=False,
+            description="最大允许静默秒数（正数有限值）；相邻校正时间严格大于它才形成静默区间",
+        ),
+    ],
+    min_simultaneous_boxes: Annotated[
+        int,
+        Query(
+            ge=1,
+            description="判定群体遥测中断所需的最少同时静默箱数（正整数）",
+        ),
+    ],
+) -> schemas.TelemetryOutageResult:
+    if seq_from > seq_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_range",
+                "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+            },
+        )
+
+    # 去空白；空箱号/超长箱号 -> 422；去重并保持首次出现顺序（重复不报错误）
+    normalized: list[str] = []
+    seen: set[str] = set()
+    invalid: list[str] = []
+    for raw in box_codes:
+        code = raw.strip()
+        if not code or len(code) > 64:
+            invalid.append(raw)
+            continue
+        if code not in seen:
+            seen.add(code)
+            normalized.append(code)
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_box_codes",
+                "message": "箱号去空白后不能为空，且长度不能超过 64 字符",
+                "box_codes": invalid,
+            },
+        )
+
+    return services.telemetry_outages(
+        db,
+        normalized,
+        seq_from,
+        seq_to,
+        max_silence_seconds,
+        min_simultaneous_boxes,
+    )
 
 
 def _calibration_out(

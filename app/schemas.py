@@ -303,6 +303,55 @@ class TemperatureMedianResult(BaseModel):
     )
 
 
+class TelemetryOutageSegment(BaseModel):
+    start_time: datetime = Field(
+        ..., description="极大同时静默段起点（含，半开区间；各箱保序校正后 UTC 时间）"
+    )
+    end_time: datetime = Field(
+        ..., description="极大同时静默段终点（不含，半开区间；各箱保序校正后 UTC 时间）"
+    )
+    duration_seconds: float = Field(..., description="段时长（秒）")
+    peak_simultaneous_boxes: int = Field(
+        ..., description="段内同时静默箱数的峰值（均 >= min_simultaneous_boxes）"
+    )
+
+
+class TelemetryOutageBoxDetail(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    event_count: int = Field(
+        ..., description="该箱在共同序号区间内的实际事件条数（缺号不补点）"
+    )
+    silence_interval_count: int = Field(
+        ...,
+        description=(
+            "该箱区间内相邻校正时间严格大于 max_silence_seconds 的静默区间数"
+            "（半开 [start_time, end_time)）；不足两条事件时为 0"
+        ),
+    )
+
+
+class TelemetryOutageResult(BaseModel):
+    box_codes: list[str] = Field(
+        ..., description="去重并去空白后实际参与查询的箱号列表（保持首次出现顺序）"
+    )
+    seq_from: int = Field(..., description="共同查询起始序号（含）")
+    seq_to: int = Field(..., description="共同查询结束序号（含）")
+    max_silence_seconds: float = Field(
+        ..., description="最大允许静默秒数；相邻校正时间严格大于它才形成静默区间"
+    )
+    min_simultaneous_boxes: int = Field(..., description="判定群体中断所需的最少同时静默箱数")
+    box_count: int = Field(..., description="去重后参与查询的箱数")
+    outage_segment_count: int = Field(
+        ..., description="至少 min_simultaneous_boxes 箱同时静默的极大时间段数（端点相接已合并）"
+    )
+    segments: list[TelemetryOutageSegment] = Field(
+        ..., description="极大群体静默时间段，按起点升序；无合格段为空数组"
+    )
+    box_details: list[TelemetryOutageBoxDetail] = Field(
+        ..., description="逐箱的区间事件数与静默区间数，顺序与 box_codes 一致"
+    )
+
+
 class CalibrationAnchorIn(BaseModel):
     seq: int = Field(..., ge=0, description="锚点序号（非负整数），列表内须严格递增")
     temp_offset: float = Field(
